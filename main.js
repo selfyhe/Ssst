@@ -1,5 +1,5 @@
 /************************************************
-现货短信程序化操作策略1.0 2018-1-22
+现货短信程序化操作策略v1.1 2018-1-24
 1.指数均线使用的是EMA线
 2.判断当前正在操作的类型，如果正在操作类型不为NONE，继续操作原来的卖出或买入操作，直到全部操作完成。
 3.如果继续操作类型为NONE，说明一个没有正在操作，操作流程序按以下三频来判断
@@ -14,10 +14,11 @@
 4.买入流程:
 	1）判断最后一次操作类型，如果是-1说明是初次买入，则尽量不在交叉周期大于5之后再买入；
 	2）判断最后一次操作类型为1时，并且当前交叉周期为0时，如果当前买入价格1已经超过止盈点，则入市观察期调整为0，就是当即买入，否则还是按原来的设定的入市观察期
-	3）买入一次性买入，按买入仓位比例参数，提交一次买入指令
+	3）买入的时候根据当前币种的限仓金额买入，每次买入的最大数量不超过买卖操作粒度，以防止过大的单成交时间过长
+	4）如果买入金额过大就会多次连续买入，直到买入操作完成
 5.卖出流程：
 	1）判断最后一次操作类型为-1时，说明软件此时运行时刚好出现下降行情，因此不知道持仓价格；就不作处理（最好手动在运行软件之前保持没有持币状态）。
-	----不用 2）判断卖出价格是否比大于或等于上次买入均价，没有达到就不卖，守币直到下一次卖出机会并符合条件
+	2）添加止盈卖出的仓位控制，控制在75%，余下25%等后面再退出。
 	3）如果当前交叉周期为0时，卖点刚刚出现，且当前交易所买入价格1已经超过止盈点，刚离市观察期调整为0，就是当即卖出。不然一分钟之后价格可以掉得很快
 	4）卖出，按卖出币比例卖出，提交一次卖出指令
 6.获取到交易订单状态后：
@@ -26,13 +27,22 @@
 
 策略参数如下
 参数	描述	类型	默认值
-FastPeriod	入市快线周期	数字型(number)	5
-SlowPeriod	入市慢线周期	数字型(number)	15
+FastPeriod	快线周期	数字型(number)	5
+SlowPeriod	慢线周期	数字型(number)	15
 EnterPeriod	入市观察期	数字型(number)	3
-ExitFastPeriod	离市快线周期	数字型(number)	5
-ExitSlowPeriod	离市慢线周期	数字型(number)	15
 ExitPeriod	离市观察期	数字型(number)	1
 OperateFineness	买卖操作的粒度	数字型(number)	80
+BalanceLimit	买入金额数量限制	数字型(number)	300
+NowCoinPrice	当前持币价格		数字型(number)	0
+PriceDecimalPlace	交易价格小数位		数字型(number)	2
+StockDecimalPlace	交易数量小数位		数字型(number)	0
+MinStockAmount	最小交易数量		数字型(number)	1
+SlidePriceNum	下单滑动价		数字型(number)	0.0001
+BuyFee	平台买入手续费		数字型(number)	0.002
+SellFee	平台卖出手续费		数字型(number)	0.002
+RetryDelay     重试时间 数字型(number)  1000
+MAType	均线算法	下拉框(selected)	EMA|MA|AMA(自适应均线)
+DebugMode	是否调试模式		下拉框型	0|1
 Interval	轮询周期(秒)	数字型(number)	5
 ************************************************/
 
@@ -51,66 +61,69 @@ var operatingStatus = OPERATE_STATUS_NONE;	//正在操作的状态
 var lastOperateType = OPERATE_STATUS_NONE;	//最后一次操作的类型，如果最后一次操作为-1，说明软件运行之后还没有操作过交易，如果ORDER_TYPE_BUY=0，ORDER_TYPE_SELL=1
 var isCancelAllWS = true;  //退出时取消所有挂单
 var isResetLogo = true;  //运行时生重置所有的日志
+var canTargetProfitNum = 0;	//可止盈卖出量
+var doingTargetProfitSell = false;	//正在操作止盈卖出
+var buyTotalPay = 0;	//购买累计支付金额
 
-//判断当前均线周期，以分钟为单位
-function getAverageCycle(){
-	var ret = 1;
-	var records = exchange.GetRecords();
-	var timediff = records[1].Time - records[0].Time;
-	ret = timediff/(60*1000);
+
+//获取当前行前的振幅
+function getPriceAmplitude(){
+	var ret = 1.000;
+	var symbol = exchange.GetCurrency();
+	symbol = symbol.replace("_","");
+	symbol = symbol.toLowerCase();
+	var obj = exchange.IO("api", "GET", "/market/detail", "symbol="+symbol);
+	if(obj){
+		ret = _N(obj.tick.high/obj.tick.low,3)
+		Log("当前价：",obj.tick.close,"最高价：",obj.tick.high,"，最低价：",obj.tick.low,"，上下振幅：",ret,"，调试模式：",ret);
+	}
 	return ret;
 }
 
 //根据均线周期决定开始止盈的时间起点
-function getTargetProfit(cycleminite){
-	var profit = 1.1;
-	switch(cycleminite){
-		case 1:
-			profit = 1.01;
-			break;
-		case 5:
-			profit = 1.05;
-			break;
-		case 10:
-			profit = 1.1;
-			break;
-		case 15:
-			profit = 1.15;
-			break;
-		case 30:
-			profit = 1.20;
-			break;
-		case 60:
-			profit = 1.25;
-			break;
-	}
+function getTargetProfit(pa){
+	var minprofit = 1.010;
+	var maxprofit = 1.501;
+	var profit = _N((pa-1)/2+1,3);
+	profit = Math.max(profit, minprofit);
+	profit = Math.min(profit, maxprofit);
 	return profit;
 }
 
 //检测卖出订单是否成功
-function checkSellFinish(){
+function checkSellFinish(crossperiod){
+    var ret = true;
 	var order = exchange.GetOrder(lastOrderId);
 	if(order.Status === ORDER_STATE_CLOSED ){
-		var profit = order.AvgPrice - lastBuyPrice;
+		var profit = (order.AvgPrice - lastBuyPrice)*order.DealAmount;
 		Log("订单",lastOrderId,"交易成功!平均卖出价格：",order.AvgPrice,"，买入价格：",lastBuyPrice,"，浮动盈利：",profit);
 		LogProfit(profit);
 		//设置最后一次卖出价格
 		lastSellPrice = order.AvgPrice;
 	}else if(order.Status === ORDER_STATE_PENDING ){
-		if(order.DealAmount){
-			Log("订单",lastOrderId,"部分成交!卖出数量：",order.DealAmount,"，剩余数量：",order.Amount - order.DealAmount);
-			var profit = order.AvgPrice - lastBuyPrice;
-			LogProfit(profit);
-			//设置最后一次卖出价格
-			lastSellPrice = order.AvgPrice;
-		}else{
-			Log("订单",lastOrderId,"未有成交!卖出价格：",order.Price,"，当前买一价：",exchange.GetTicker().Buy,"，价格差：",order.Price - exchange.GetTicker().Buy);
-		}
-		//撤消没有完成的订单
-		exchange.CancelOrder(lastOrderId);
-		Log("取消卖出订单：",lastOrderId);
-		Sleep(1300);
+        //如果依然在下行通道，判断价格变化是否超过止损点，如果没有就继续挂单不取消
+        var sellprice = _N(lastBuyPrice*(1+SellFee+BuyFee),PriceDecimalPlace);
+        var sellprofit = lastBuyPrice/exchange.GetTicker().Buy;
+        if(crossperiod < 0 && sellprofit < 1.05 && sellprice === order.Price){
+            Log("挂单",lastOrderId,"未有成交,市场行情没有太大变化，依然下行，当前价与挂单价",order.Price,"变化不大，继续保持挂单。");
+            ret = false;
+        }else{
+		    if(order.DealAmount){
+			    Log("订单",lastOrderId,"部分成交!卖出数量：",order.DealAmount,"，剩余数量：",order.Amount - order.DealAmount);
+			    var profit = (order.AvgPrice - lastBuyPrice)*order.DealAmount;
+			    LogProfit(profit);
+			    //设置最后一次卖出价格
+			    lastSellPrice = order.AvgPrice;
+		    }else{
+			    Log("订单",lastOrderId,"未有成交!卖出价格：",order.Price,"，当前买一价：",exchange.GetTicker().Buy,"，价格差：",_N(order.Price - exchange.GetTicker().Buy, PriceDecimalPlace));
+		    }
+		    //撤消没有完成的订单，如果交叉周期在5以内不急着取消挂单        
+		    exchange.CancelOrder(lastOrderId);
+		    Log("取消卖出订单：",lastOrderId);
+		    Sleep(1300);
+        }
 	}
+    return ret;
 }
 
 //检测买入订单是否成功
@@ -120,41 +133,23 @@ function checkBuyFinish(){
 		Log("买入订单",lastOrderId,"交易成功!订单买入价格：",order.Price,"，平均买入价格：",order.AvgPrice,"，买入数量：",order.DealAmount);
 		//设置最后一次买入价格
 		lastBuyPrice = order.AvgPrice;
+		//累加成交价格
+		buyTotalPay += order.AvgPrice*order.DealAmount;
 	}else if(order.Status === ORDER_STATE_PENDING ){
 		if(order.DealAmount){
 			Log("买入订单",lastOrderId,"部分成交!订单买入价格：",order.Price,"，平均买入价格：",order.AvgPrice,"，买入数量：",order.DealAmount);
 			//设置最后一次买入价格
 			lastBuyPrice = order.AvgPrice;
+			//累加成交价格
+			buyTotalPay += order.AvgPrice*order.DealAmount;
 		}else{
-			Log("买入订单",lastOrderId,"未有成交!订单买入价格：",order.Price,"，当前卖一价：",exchange.GetTicker().Sell,"，价格差：",order.Price - exchange.GetTicker().Sell);
+			Log("买入订单",lastOrderId,"未有成交!订单买入价格：",order.Price,"，当前卖一价：",exchange.GetTicker().Sell,"，价格差：",_N(order.Price - exchange.GetTicker().Sell, PriceDecimalPlace));
 		}
 		//撤消没有完成的订单
 		exchange.CancelOrder(lastOrderId);
 		Log("取消买入订单：",lastOrderId);
 		Sleep(1300);
 	}
-}
-
-// 取消所有挂单 函数
-function cancelPending() { 
-    Log("操作取消所有挂单。");                                 
-    var ret = false;                                            // 设置 返回成功  标记变量
-    while (true) {                                              // while 循环
-        if (ret) {                                              // 如果 ret 为 true 则 Sleep 一定时间
-            Sleep(1300);
-        }
-        var orders = _C(exchange.GetOrders);                    // 调用  API 获取 交易所 未完成的订单信息
-        if (orders.length == 0) {                               // 如果返回的是  空数组， 即 交易所 没有未完成的订单。
-            break;                                              // 跳出 while 循环
-        }
-
-        for (var j = 0; j < orders.length; j++) {               // 遍历 未完成的 订单数组， 并根据索引j 逐个使用  orders[j].Id 去 取消订单。
-            exchange.CancelOrder(orders[j].Id, orders[j]);
-			Log("取消订单：",orders[j].Id); 
-            ret = true;                                         // 一旦有取消操作， ret 赋值 为 true 。用于触发 以上 Sleep ， 等待后重新 exchange.GetOrders 检测 
-        }
-    }
-    return ret;                                                 // 返回 ret
 }
 
 //程序运行时重置所有的日志
@@ -167,34 +162,112 @@ function init(){
 
 // 程序 退出 时的收尾函数。
 function onexit() {                             
-    if (isCancelAllWS) {                          // 设置了 停止时取消所有挂单，则 调用 cancelPending() 函数 取消所有挂单
-        Log("正在退出, 尝试取消所有挂单");
-        cancelPending();
+    if (isCancelAllWS && lastOrderId) {                          // 设置了 停止时取消所有挂单，则 调用 cancelPending() 函数 取消所有挂单
+        Log("正在退出, 尝试取消上一个订单");
+        exchange.CancelOrder(lastOrderId);
     }
     Log("策略成功停止");
     Log(_C(exchange.GetAccount));               // 打印退出程序时的  账户持仓信息。
+}
+
+// 返回上穿的周期数. 正数为上穿周数, 负数表示下穿的周数, 0指当前价格一样
+function Cross(a, b) {
+    var pfnMA = [TA.EMA, TA.MA, talib.KAMA][MAType];
+    var crossNum = 0;
+    var arr1 = [];
+    var arr2 = [];
+    if (Array.isArray(a)) {
+        arr1 = a;
+        arr2 = b;
+    } else {
+        var records = null;
+        while (true) {
+            records = exchange.GetRecords();
+            if (records && records.length > a && records.length > b) {
+                break;
+            }
+            Sleep(RetryDelay);
+        }
+        arr1 = pfnMA(records, a);
+        arr2 = pfnMA(records, b);
+    }
+    if (arr1.length !== arr2.length) {
+        throw "array length not equal";
+    }
+    for (var i = arr1.length-1; i >= 0; i--) {
+        if (typeof(arr1[i]) !== 'number' || typeof(arr2[i]) !== 'number') {
+            break;
+        }
+        if (arr1[i] < arr2[i]) {
+            if (crossNum > 0) {
+                break;
+            }
+            crossNum--;
+        } else if (arr1[i] > arr2[i]) {
+            if (crossNum < 0) {
+                break;
+            }
+            crossNum++;
+        } else {
+            break;
+        }
+    }
+    return crossNum;
 }
 
 //主程序函数
 function main() {
 	Log("启动数字货币现货交易正向收益策略程序...");  
 	//获取止盈止损点，不同K线周期的情况下，止盈止损点不一样。
-	var cycleminite = getAverageCycle();
-	var profit = getTargetProfit();
-	Log("根据当前K线周期",cycleminite,"，当前的止盈止损点为",profit);  
+	var pa = getPriceAmplitude();
+	var targetProfit = getTargetProfit(pa);
+	var hasGetPA = true;
+	if(NowCoinPrice > 0){
+        lastBuyPrice = NowCoinPrice;
+        lastOperateType = OPERATE_STATUS_BUY;
+    }
+	Log("持仓价格：",lastBuyPrice,"，限制持仓金额：",BalanceLimit,"，买卖操作粒度：",OperateFineness,"，交易价格小数位：",PriceDecimalPlace,"，交易数量小数位：",StockDecimalPlace,"，最小交易量：",MinStockAmount);  
+
+    //设置小数位，第一个为价格小数位，第二个为数量小数位
+    exchange.SetPrecision(PriceDecimalPlace, StockDecimalPlace);
 
 	//主操作循环
     while (true) {
+		//每小时取一次行情，判断当前振幅如果少于平台手续费，就不操作
+		if(new Date().getMinutes()>5){
+			hasGetPA = false;	
+		}else{
+			if(!hasGetPA){
+				pa = getPriceAmplitude();
+				targetProfit = getTargetProfit(pa);
+				hasGetPA = true;
+			}
+		}
+		if(pa < 1.002 && !DebugMode){
+			Log("当前行情振幅太小，只有",pa,"，赚得不够手续费，暂时不操作，一小时之后再看。");
+			Sleep(5*60*1000);
+			continue;			
+		}
+		
 		//交易买卖操作相关变量
 		var opAmount = 0;
-		var obj = null;
+		var orderid = 0;
 		var isOperated = false;		
 		var willOperateType = OPERATE_STATUS_NONE;	//准备操作的类型,根据此变量的值来选择操作流程
+        var operateinterval = Interval;
+        
+        //获得交叉周期数
+        var crossPeriod = Cross(FastPeriod, SlowPeriod);
 		
 		//检测上一个订单，成功就改状态，不成功就取消重新发
 		if(lastOrderId && operatingStatus != OPERATE_STATUS_NONE){
 			if(operatingStatus > OPERATE_STATUS_BUY){
-				checkSellFinish()
+				var finish = checkSellFinish(crossPeriod);
+                if(!finish){
+                    //暂停指定时间
+                    Sleep(60*1000);
+                    continue;
+                }
 			}else{
 				checkBuyFinish();
 			}
@@ -205,6 +278,12 @@ function main() {
 		//重新获取帐号信息，显示当前仓位信息
 		initAccount = exchange.GetAccount();
 		Log("当前帐号信息，资金：",initAccount.Balance,"，持币：",initAccount.Stocks,"，冻结资金：",initAccount.FrozenBalance,"，冻结币：",initAccount.FrozenStocks);		
+
+        //判断行情是否发生了反转，如果是取消原来的操作
+        if(crossPeriod > 0 && operatingStatus == OPERATE_STATUS_SELL || crossPeriod < 0 && operatingStatus == OPERATE_STATUS_BUY){
+            operatingStatus = OPERATE_STATUS_NONE;
+            Log("行情发生反转，取消原来的操作流程。");
+        }
 		
 		//判断并选择操作流程
 		if(operatingStatus != OPERATE_STATUS_NONE){
@@ -213,9 +292,7 @@ function main() {
 			var msg = willOperateType == OPERATE_STATUS_BUY ? "买入" : "卖出";
 			Log(msg,"操作还没有完成，继续直接操作",msg,"流程。");
 		}else{			
-			//分析交叉周期数
-			var crossPeriod = $.Cross(FastPeriod, SlowPeriod);
-			Log("获取行情成功，开始分析行情...");  
+			Log("获取行情成功，当前行情振幅：",pa,"，止盈止损点：",targetProfit,"开始分析行情...");  
 			//上一个买入卖出的操作已经完成，需要观察情况
 			if(crossPeriod === 0){
 				//当前两条均线刚刚交叉
@@ -243,12 +320,14 @@ function main() {
 					//判断最后一次操作类型为0时，说明是买入后继续上升
 					//判断是否价格超过止盈点
 					var profitrate = exchange.GetTicker().Buy/lastBuyPrice;
-					if(profitrate >= profit){
+					if(profitrate >= targetProfit){
 						//当前价超过买入价已经超过止盈点，操作卖出
 						willOperateType = OPERATE_STATUS_SELL;
-						Log("当前强势上升，当前价：",exchange.GetTicker().Buy,"，已经超过买入价：",lastBuyPrice,"的止盈点",profit,"，操作卖出流程。"); 
+						//开始操作止盈卖出
+						doingTargetProfitSell = true;
+						Log("当前强势上升，上穿数为",crossPeriod,"，当前价：",exchange.GetTicker().Buy,"，已经超过买入价：",lastBuyPrice,"的止盈点",targetProfit,"，操作卖出流程。"); 
 					}else{
-						Log("当前依然是上升通道，当前价：",exchange.GetTicker().Buy,"，未超买入价：",lastBuyPrice,"的止盈点",profit,"，继续观望。"); 
+						Log("当前依然是上升通道，上穿数为",crossPeriod,"，当前价：",exchange.GetTicker().Buy,"，未超买入价：",lastBuyPrice,"的止盈点",targetProfit,"，继续观望。"); 
 					}
 				}else{
 					//判断最后一次操作类型为1或-1时（卖出或是新运行），应该操作买入流程
@@ -277,7 +356,7 @@ function main() {
 				//刚刚开始准备买入
 				if(lastOperateType == OPERATE_STATUS_NONE){
 					//最后一次操作类型，如果是-1说明是初次买入
-					if(crossPeriod >= 5){
+					if(crossPeriod >= 6){
 						tmpEnterPeriod = 9999;
 						Log("没有操作过卖出之前，运行后已经连续上涨了五个K线以上，不再适合买入，入市观察期调整为9999。"); 
 					}
@@ -285,28 +364,42 @@ function main() {
 					//上一次卖完，现在准备买入
 					//最后一次操作类型为1时,判断价格下跌情况
 					var profitbuy = lastSellPrice/exchange.GetTicker().Sell;
-					if(crossPeriod === 0 && profitbuy >= profit){
+					if(crossPeriod <= 1 && profitbuy >= targetProfit){
 						tmpEnterPeriod = 0;
 						Log("较上一次卖出价格，现在已经下跌足够止盈点，买入机会进来了，第一时间操作买入。"); 
+					}else{
+						//当前价格没有如果没有超过千万之二，暂不入市，入市观察期调为9999;
+                        if(crossPeriod > 5){
+                            tmpEnterPeriod = 9999;
+							Log("当前为上升通道，上穿数为",crossPeriod," > 5 已经错最佳的买入机会，继续观察行情。"); 
+                        }
 					}
 				}
+				
 			}
 			if (crossPeriod >= tmpEnterPeriod) {
 				Log("当前为上升通道，上穿数为",crossPeriod,"，入市观察期为",tmpEnterPeriod,"，买入机会来了，准备买入操作，每次买入的粒度为",OperateFineness); 
-				var tmpPayFee = OperateFineness*exchange.GetTicker().Sell
-				if(initAccount.Balance <= tmpPayFee) tmpPayFee = initAccount.Balance-0.01;
-				opAmount = parseFloat(tmpPayFee).toFixed(2);
-				if(opAmount > 0.01){
-					Log("准备以当前价格买入，买入金额为",opAmount,"，当前卖1价格为",exchange.GetTicker().Sell); 
-					obj = $.Buy(opAmount);
+				//火币现货Buy()参数是买入个数，不是总金额
+				var canpay = BalanceLimit - buyTotalPay;
+				if(initAccount.Balance < canpay){
+					canpay = initAccount.Balance;
+				}
+				var canbuy = canpay/exchange.GetTicker().Sell;
+				opAmount = canbuy > OperateFineness? OperateFineness : canbuy;
+				opAmount = _N(opAmount, StockDecimalPlace);
+				if(opAmount > MinStockAmount){
+					Log("准备买入，限仓金额：",canpay,"，可买金额:",canpay,"，可买数量：",canbuy,"，本次买入数量:",opAmount,"，当前卖1价格:",exchange.GetTicker().Sell); 
+					orderid = exchange.Buy(exchange.GetTicker().Sell,opAmount);
 					operatingStatus = OPERATE_STATUS_BUY;
 					isOperated = true;
 				}else{
-					Log("买币操作已经完成，已经全部买进。" ); 
 					//修改最后一次操作的类型
-					lastOperateType = ORDER_TYPE_BUY;
+					lastOperateType = operatingStatus;
 					//重置订单操作状态
 					operatingStatus = OPERATE_STATUS_NONE;	
+					Log("买币操作已经完成，已经全部买进，累计买入金额：",buyTotalPay,"，继续观察行情。" ); 
+					//重置成交累计价格
+					buyTotalPay = 0;
 				}
 			}else{
 				Log("当前处于上升通道，上穿数为",crossPeriod,"，< 入市观察期",tmpEnterPeriod,"，等待买入机会出现。"); 
@@ -322,49 +415,84 @@ function main() {
 				tmpExitPeriod = 0;
 			}else{
 				//刚刚开始准备卖出
-				if(lastOperateType == OPERATE_STATUS_NONE){
+				if(lastOperateType == OPERATE_STATUS_NONE && lastBuyPrice === 0){
 					//最后一次操作类型为-1时，说明软件此时运行时刚好出现下降行情，因此不知道持仓价格；就不作处理
 					tmpExitPeriod = 9999;
 					Log("当前处于下降通道，策略运行之后没有买入过，不知道买入价格不能随便卖出，入市观察期调整为9999。"); 
 				}else{
 					//判断交叉周期决定是否要快速卖出,判断价格下跌情况
 					var profitsell = exchange.GetTicker().Buy/lastBuyPrice;
-					if(crossPeriod === 0 && profitsell >= profit){
+					if(crossPeriod === 0 && profitsell >= targetProfit){
 						tmpExitPeriod = 0;
 						Log("卖点出现，当前交易所买入价格1高于止盈点，第一时间操作卖出。"); 
 					}
 				}
 			}
-			if (Math.abs(crossPeriod) >= tmpExitPeriod) {
-				Log("行情下在为下行通道，下穿数为",crossPeriod,"，>= 离市观察期",tmpExitPeriod,"，准备卖出操作。"); 
-				opAmount = initAccount.Stocks > OperateFineness? OperateFineness : parseFloat(initAccount.Stocks-0.01).toFixed(2);
-				if(opAmount > 0.01){
-					Log("准备以当前价格卖出，卖出数量为",opAmount,"，当前买1价格为",exchange.GetTicker().Buy); 
-					obj = $.Sell(opAmount);
+			//如果是上行通道的止盈操作，保留25%的仓位，如果是下行清仓，就清到完。
+			if(doingTargetProfitSell){
+				Log("行情在上行通道说明是止盈操作，进行部份卖出，保留25%的仓位，准备卖出操作。"); 
+				if(canTargetProfitNum === 0) canTargetProfitNum = initAccount.Stocks*0.75;
+				opAmount = canTargetProfitNum > OperateFineness? OperateFineness : _N(canTargetProfitNum,StockDecimalPlace);
+				if(opAmount > MinStockAmount){
+					var price = exchange.GetDepth().Asks[2].Price+SlidePriceNum;
+					Log("准备以当前卖出价格3上浮滑价止盈挂单卖出，挂单数量为",opAmount,"，价格为",price); 
+					orderid = exchange.Sell(price,opAmount);
 					operatingStatus = OPERATE_STATUS_SELL;
 					isOperated = true;
+                    //挂单价格较高，调整操作频率为60秒
+                    operateinterval = 60;
 				}else{
-					Log("卖币操作完成，持仓已经清空。" ); 
-					//修改最后一次操作的类型
-					lastOperateType = ORDER_TYPE_SELL;
+					//止盈卖出操作完成
+					doingTargetProfitSell = false;
 					//重置订单操作状态
 					operatingStatus = OPERATE_STATUS_NONE;
+					Log("止盈卖币操作完成，持币量已经降到",initAccount.Stocks,"，继续观察行情。" ); 
 				}
 			}else{
-				Log("当前均线下穿数为：",crossPeriod," < 离市观察期：",tmpExitPeriod,"，不做操作保持观察。"); 
+				//下行通道卖出
+				if (Math.abs(crossPeriod) >= tmpExitPeriod) {
+					Log("行情下在为下行通道，下穿数为",crossPeriod,"，>= 离市观察期",tmpExitPeriod,"，准备卖出操作。"); 
+					opAmount = initAccount.Stocks > OperateFineness? OperateFineness : _N(initAccount.Stocks,StockDecimalPlace);
+					if(opAmount > MinStockAmount){
+                        //分析当前应该用什么价格来卖出，这个时候卖出价格不参用_N函数来计算，不然就会亏了。价格也不要设得刚刚好，多加上手续费好点
+                        var maxsellprice = parseFloat((Math.max(exchange.GetTicker().Buy,lastBuyPrice*(1+SellFee*2+BuyFee))).toFixed(PriceDecimalPlace));
+                        var sellprofit = lastBuyPrice/exchange.GetTicker().Buy;
+                        if(sellprofit > 1.05){
+                            //如果当前价格已经跌下5%，止损退出
+                            maxsellprice = exchange.GetTicker().Buy;
+                            Log("当前价已经跌超买入价的",sellprofit,"> 1.05 进行止损卖出，数量为",opAmount,"，当前价格为",exchange.GetTicker().Buy); 
+                        }else{
+                            //如果价格可以接受，那就比较当前价与买入价+交易手续费*2哪个利盈高，就用哪个挂单
+						    Log("当前价没有跌超买入价的5%，仅下跌",sellprofit,"，不急卖，以当前价与买入价+交易手续费*3中较高者挂单卖",opAmount,"，当挂单价格为",maxsellprice); 
+                            //因为挂单价格较高，调整操作频率为1分钟,给一定的卖出时间
+                            operateinterval = 60;
+                        }
+						orderid = exchange.Sell(maxsellprice,opAmount);
+						operatingStatus = OPERATE_STATUS_SELL;
+						isOperated = true;
+					}else{
+						Log("卖币操作完成，持仓已经清空，继续观察行情。" ); 
+						//修改最后一次操作的类型
+						lastOperateType = operatingStatus;
+						//重置订单操作状态
+						operatingStatus = OPERATE_STATUS_NONE;
+					}
+				}else{
+					Log("当前均线下穿数为：",crossPeriod," < 离市观察期：",tmpExitPeriod,"，不做操作保持观察。"); 
+				}
 			}
 		}
 		//判断并输出操作结果
 		if(isOperated){
-			if (obj) {
-				//保存最后订单编号
-				lastOrderId = isNaN(obj) ? obj.Id : obj;
-				Log("订单发送成功，订单编号：",lastOrderId,"，订单详情：", obj);
+			if (orderid) {
+				lastOrderId = orderid;
+				Log("订单发送成功，订单编号：",lastOrderId);
 			}else{
-				Log("订单发送失败，obj=", obj);
+				operatingStatus = OPERATE_STATUS_NONE;
+				Log("订单发送失败，取消正在操作状态");
 			}
 		}
 		//暂停指定时间
-        Sleep(Interval*1000);
+        Sleep(operateinterval*1000);
     }
 }
