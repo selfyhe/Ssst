@@ -1,5 +1,5 @@
 /************************************************
-现货短信程序化操作策略v1.1 2018-1-24
+现货短线程序化操作策略v1.2 2018-1-29 调整下行通道时止盈卡损点算法
 1.指数均线使用的是EMA线
 2.判断当前正在操作的类型，如果正在操作类型不为NONE，继续操作原来的卖出或买入操作，直到全部操作完成。
 3.如果继续操作类型为NONE，说明一个没有正在操作，操作流程序按以下三频来判断
@@ -42,6 +42,7 @@ BuyFee	平台买入手续费		数字型(number)	0.002
 SellFee	平台卖出手续费		数字型(number)	0.002
 RetryDelay     重试时间 数字型(number)  1000
 MAType	均线算法	下拉框(selected)	EMA|MA|AMA(自适应均线)
+DefaultProfit 默认止损点	数字型(number)	1.05
 DebugMode	是否调试模式		下拉框型	0|1
 Interval	轮询周期(秒)	数字型(number)	5
 ************************************************/
@@ -65,7 +66,6 @@ var canTargetProfitNum = 0;	//可止盈卖出量
 var doingTargetProfitSell = false;	//正在操作止盈卖出
 var buyTotalPay = 0;	//购买累计支付金额
 
-
 //获取当前行前的振幅
 function getPriceAmplitude(){
 	var ret = 1.000;
@@ -75,18 +75,54 @@ function getPriceAmplitude(){
 	var obj = exchange.IO("api", "GET", "/market/detail", "symbol="+symbol);
 	if(obj){
 		ret = _N(obj.tick.high/obj.tick.low,3)
-		Log("当前价：",obj.tick.close,"最高价：",obj.tick.high,"，最低价：",obj.tick.low,"，上下振幅：",ret,"，调试模式：",ret);
+		Log("当前价：",obj.tick.close,"最高价：",obj.tick.high,"，最低价：",obj.tick.low,"，上下振幅：",ret);
 	}
 	return ret;
 }
 
-//根据均线周期决定开始止盈的时间起点
-function getTargetProfit(pa){
-	var minprofit = 1.010;
-	var maxprofit = 1.501;
-	var profit = _N((pa-1)/2+1,3);
-	profit = Math.max(profit, minprofit);
-	profit = Math.min(profit, maxprofit);
+//根据行性数字序列获取线性趋势，大于1为上升通道，小于1为下降通道
+function getLinearTrend(linearray){
+    var trend = 1;
+    var sub = 0;
+    if(linearray && linearray.length>=2){
+        for(var i=1;i<=linearray.length-1;i++){
+            sub += linearray[i]/linearray[i-1];
+        }
+        trend = sub/(linearray.length-1);
+    }
+    return trend;
+}
+
+//获得当前10个小时之内的收盘价数字序列
+function getQuotation(){
+    var recrods = _C(exchange.GetRecords,PERIOD_H1);
+    var quotations = null;
+    if(recrods && recrods.length>=2){
+        quotations = recrods.length<10 ? new Array(recrods.length) : new Array(10);
+        var j=0;
+        for(var i=recrods.length-quotations.length;i<=recrods.length-1;i++){
+            quotations[j] = recrods[i].Close;
+            j++;
+        }
+    }
+    return quotations;
+}
+
+
+//根据均线周期决定及最近10小时的行情线性变化，开始止盈的时间起点
+//如果行情是下行通道5个点就可以了，如果是上行通道，那按振幅来算出来
+function getTargetProfit(pa,lastprofit){
+	var profit = DefaultProfit;
+	var lineartrend = getLinearTrend(getQuotation());
+	if(lineartrend>1){
+		var minprofit = 1.010;
+		var maxprofit = 1.501;
+		profit = parseFloat(((pa-1)/2+1).toFixed(3));
+		profit = Math.max(profit, minprofit);
+		profit = Math.min(profit, maxprofit);
+	}else if(lineartrend === 1){
+        profit = lastprofit;
+    }
 	return profit;
 }
 
@@ -155,7 +191,7 @@ function checkBuyFinish(){
 //程序运行时重置所有的日志
 function init(){
 	if (isResetLogo) {                                 // RestData 为界面参数， 默认 true ， 控制 启动时 是否清空所有数据。默认全部清空。
-        LogProfitReset();                            // 执行 API LogProfitReset 函数，清空 所有收益。
+        //LogProfitReset();                            // 执行 API LogProfitReset 函数，清空 所有收益。
         LogReset();                                  // 执行 API LogReset 函数， 清空 所有日志。
     }
 }
@@ -220,7 +256,7 @@ function main() {
 	Log("启动数字货币现货交易正向收益策略程序...");  
 	//获取止盈止损点，不同K线周期的情况下，止盈止损点不一样。
 	var pa = getPriceAmplitude();
-	var targetProfit = getTargetProfit(pa);
+	var targetProfit = getTargetProfit(pa,DefaultProfit);
 	var hasGetPA = true;
 	if(NowCoinPrice > 0){
         lastBuyPrice = NowCoinPrice;
@@ -239,7 +275,7 @@ function main() {
 		}else{
 			if(!hasGetPA){
 				pa = getPriceAmplitude();
-				targetProfit = getTargetProfit(pa);
+				targetProfit = getTargetProfit(pa, targetProfit);
 				hasGetPA = true;
 			}
 		}
@@ -457,10 +493,10 @@ function main() {
                         //分析当前应该用什么价格来卖出，这个时候卖出价格不参用_N函数来计算，不然就会亏了。价格也不要设得刚刚好，多加上手续费好点
                         var maxsellprice = parseFloat((Math.max(exchange.GetTicker().Buy,lastBuyPrice*(1+SellFee*2+BuyFee))).toFixed(PriceDecimalPlace));
                         var sellprofit = lastBuyPrice/exchange.GetTicker().Buy;
-                        if(sellprofit > 1.05){
-                            //如果当前价格已经跌下5%，止损退出
+                        if(sellprofit > DefaultProfit){
+                            //如果当前价格已经跌下默认止损点，止损退出
                             maxsellprice = exchange.GetTicker().Buy;
-                            Log("当前价已经跌超买入价的",sellprofit,"> 1.05 进行止损卖出，数量为",opAmount,"，当前价格为",exchange.GetTicker().Buy); 
+                            Log("当前价已经跌超买入价的",sellprofit,"> 默认止损点",DefaultProfit," 进行止损卖出，数量为",opAmount,"，当前价格为",exchange.GetTicker().Buy); 
                         }else{
                             //如果价格可以接受，那就比较当前价与买入价+交易手续费*2哪个利盈高，就用哪个挂单
 						    Log("当前价没有跌超买入价的5%，仅下跌",sellprofit,"，不急卖，以当前价与买入价+交易手续费*3中较高者挂单卖",opAmount,"，当挂单价格为",maxsellprice); 
