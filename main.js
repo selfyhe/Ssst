@@ -39,7 +39,7 @@ SlidePriceNum	下单滑动价		数字型(number)	0.0001
 BuyFee	平台买入手续费		数字型(number)	0.002
 SellFee	平台卖出手续费		数字型(number)	0.002
 MAType	均线算法	下拉框(selected)	EMA|MA|AMA(自适应均线)
-DefaultProfit 默认止损点	数字型(number)	1.05
+DefaultProfit 默认止损点	数字型(number)	0.05
 DebugMode	是否调试模式		下拉框型	0|1
 Interval	轮询周期(秒)	数字型(number)	5
 ************************************************/
@@ -87,13 +87,13 @@ function getStockDecimalPlace() {
 
 //获取当前行前的振幅
 function getPriceAmplitude(){
-	var ret = 1.002;
+	var ret = 0.002;
 	var symbol = exchange.GetCurrency();
 	symbol = symbol.replace("_","");
 	symbol = symbol.toLowerCase();
 	var obj = exchange.IO("api", "GET", "/market/detail", "symbol="+symbol);
 	if(obj){
-		ret = _N(obj.tick.high/obj.tick.low,3)
+		ret = _N((obj.tick.high-obj.tick.low)/obj.tick.high,3)
 		Log("当前价：",obj.tick.close,"最高价：",obj.tick.high,"，最低价：",obj.tick.low,"，上下振幅：",ret);
 	}
 	return ret;
@@ -134,9 +134,9 @@ function getTargetProfit(lineartrend,pa,lastprofit){
 	var profit = DefaultProfit;
 	//var lineartrend = getLinearTrend(getQuotation());
 	if(lineartrend>1){
-		var minprofit = 1.010;
-		var maxprofit = 1.501;
-		profit = parseFloat(((pa-1)/2+1).toFixed(3));
+		var minprofit = 0.010;
+		var maxprofit = 0.501;
+		profit = parseFloat((pa/2+1).toFixed(3));
 		profit = Math.max(profit, minprofit);
 		profit = Math.min(profit, maxprofit);
 	}else if(lineartrend === 1){
@@ -158,9 +158,8 @@ function checkSellFinish(crossperiod){
 		lastSellPrice = order.AvgPrice;
 	}else if(order.Status === ORDER_STATE_PENDING ){
         //如果依然在下行通道，判断价格变化是否超过止损点，如果没有就继续挂单不取消
-        var sellprice = _N(lastBuyPrice*(1+SellFee+BuyFee),PriceDecimalPlace);
-        var sellprofit = lastBuyPrice/Ticker.Buy;
-        if(crossperiod < 0 && sellprofit < 1.05 && sellprice === order.Price){
+        var sellprofit = (lastBuyPrice-Ticker.Buy)/lastBuyPrice;
+        if(order.DealAmount === 0 && crossperiod < 0 && sellprofit < 0.05){
             Log("挂单",lastOrderId,"未有成交,市场行情没有太大变化，依然下行，当前价与挂单价",order.Price,"变化不大，继续保持挂单。");
             ret = false;
         }else{
@@ -310,7 +309,7 @@ function main() {
 			var pa = getPriceAmplitude();
 			Log("重新取得振幅",pa);
 			targetProfit = getTargetProfit(lineartrend, pa, targetProfit);
-			if(pa < 1.002 && !DebugMode){
+			if(pa < 0.002 && !DebugMode){
 				Log("当前行情振幅太小，只有",pa,"，赚得不够手续费，暂时不操作，一小时之后再看。");
 				Sleep(60*60*1000);
 				continue;			
@@ -526,7 +525,7 @@ function main() {
 					if(opAmount > MinStockAmount){
                         //分析当前应该用什么价格来卖出，这个时候卖出价格不参用_N函数来计算，不然就会亏了。价格也不要设得刚刚好，多加上手续费好点
                         var maxsellprice = parseFloat((Math.max(Ticker.Buy,lastBuyPrice*(1+SellFee*2+BuyFee))).toFixed(PriceDecimalPlace));
-                        var sellprofit = lastBuyPrice/Ticker.Buy;
+                        var sellprofit = (lastBuyPrice-Ticker.Buy)/lastBuyPrice;
                         if(sellprofit > DefaultProfit){
                             //如果当前价格已经跌下默认止损点，止损退出
                             maxsellprice = Ticker.Buy;
